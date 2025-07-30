@@ -166,3 +166,20 @@ class TokenManager:
 
 # Create a singleton token manager instance
 token_manager = TokenManager()
+
+def get_envelopes_api() -> EnvelopesApi:
+    """
+    Dependency to get an authenticated EnvelopesApi instance.
+    This ensures we reuse the token efficiently across requests.
+    """
+    api_client = token_manager.get_api_client()
+    return EnvelopesApi(api_client)
+
+@app.post("/create-signing-session", response_model=SigningSessionResponse)
+async def create_signing_session(
+    signer_info: SignerInfo, 
+    envelopes_api: EnvelopesApi = Depends(get_envelopes_api)
+):
+    """Creates a signing session for the specified signer."""
+
+    # TODO
