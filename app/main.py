@@ -120,14 +120,23 @@ async def create_signing_session(
         
         # For form data, Dropbox Sign expects a different format
         form_data = {
+            # Your API app’s client ID
             "client_id": DROPBOX_SIGN_CONFIG["client_id"],
+
+            # The template you created in Dropbox Sign
             "template_ids[0]": DROPBOX_SIGN_CONFIG["template_id"],
-            "signers[0][role]": signer_info.role_name,    # should be "Hiring Manager"
-            "signers[0][name]": signer_info.name,
-            "signers[0][email_address]": signer_info.email,
+
+            # Signer info (must match the “Hiring Manager” role in your template)
+            "signers[0][role]": signer_info.role_name,        # e.g. "Hiring Manager"
+            "signers[0][name]": signer_info.name,             # e.g. "John"
+            "signers[0][email_address]": signer_info.email,   # e.g. "john.doe@example.com"
+
+            # Test mode flag (“1” or “0”)
             "test_mode": "1" if DROPBOX_SIGN_CONFIG["test_mode"] else "0",
-            "custom_fields[full_name]": signer_info.name,
-            "custom_fields[phone number]": signer_info.phone or "",
+
+            # Prefill your custom textboxes
+            "custom_fields[full_name]": signer_info.name,     # Must match exactly “full_name”
+            "custom_fields[phone]": signer_info.phone or "",  # Must match exactly “phone”
         }
         logger.debug(f"[2] Building Dropbox Sign API payload: form_data={form_data}")
         
@@ -197,10 +206,11 @@ async def create_signing_session(
         return SigningSessionResponse(
             signing_url=embedded_sign_url,
             session_id=session_id,
-            envelope_id=signature_request_id,  # Maps to signature_request_id
-            expires_at=expires_at
+            envelope_id=signature_request_id,
+            expires_at=expires_at,
+            client_id=DROPBOX_SIGN_CONFIG["client_id"],    # ← inject here
         )
-        
+    
     except requests.exceptions.RequestException as e:
         logger.error(f"Dropbox Sign API error: {str(e)}")
         if hasattr(e, 'response') and e.response is not None:

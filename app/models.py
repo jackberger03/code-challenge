@@ -17,10 +17,11 @@ class EnvelopeStatus(str, Enum):
     
 class SigningSessionResponse(BaseModel): 
     """Response model for signing session creation."""
-    signing_url: str
+    signing_url: str # FIXME: Change from str to HttpUrl
     session_id: str 
     envelope_id: str
     expires_at: datetime
+    client_id: str
 
 class SigningStatusResponse(BaseModel):
     """Response model for signing session status."""
