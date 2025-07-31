@@ -258,3 +258,52 @@ async def create_signing_session(
     except Exception as e:
         logger.error(f"Unexpected error in create_signing_session: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to create signing session")
+    
+def create_envelope_from_template(signer_info: SignerInfo) -> EnvelopeDefinition:
+    """
+    Creates an envelope definition using a DocuSign template.
+    Templates are pre-made documents with placeholder fields - perfect for repeated use.
+    """
+    # Create the signer object with the user's information
+    signer = Signer(
+        email=signer_info.email,
+        name=signer_info.name,
+        recipient_id="1",  # Identifies this recipient in the envelope
+        routing_order="1",  # Order in which recipients sign (important for multiple signers)
+        client_user_id=str(uuid.uuid4())  # Links this signer to the embedded view
+    )
+    
+    # Package the signer into a recipients object
+    recipients = Recipients(signers=[signer])
+    
+    # Create the envelope definition
+    envelope_definition = EnvelopeDefinition(
+        template_id=DOCUSIGN_CONFIG["template_id"],
+        recipients=recipients,
+        status="sent",  # "sent" means ready for signing, "created" would save as draft
+        email_subject="Please sign this document",
+        email_blurb="Thanks for your business. Please review and sign the attached document."
+    )
+    
+    # to pre-fill template fields with data, add template roles:
+    # envelope_definition.template_roles = [
+    #     TemplateRole(
+    #         email=signer_info.email,
+    #         name=signer_info.name,
+    #         role_name="signer",  # Must match the role name in your template
+    #         tabs=TextTabs(text_tabs=[
+    #             Text(tab_label="phone", value=signer_info.phone),
+    #             Text(tab_label="address", value="123 Main St")
+    #         ])
+    #     )
+    # ]
+    
+    return envelope_definition
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint to verify the service is running.
+    In production, you might also check DocuSign connectivity here.
+    """
+    return {"status": "healthy", "service": "DocuSign Signing Service"}
