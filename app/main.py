@@ -175,23 +175,6 @@ def get_envelopes_api() -> EnvelopesApi:
     api_client = token_manager.get_api_client()
     return EnvelopesApi(api_client)
 
-def create_envelope_from_template(signer_info: SignerInfo) -> EnvelopeDefinition:
-    signer = Signer(
-        email=signer_info.email,
-        name=signer_info.name,
-        recipient_id="1",
-        routing_order="1",
-        client_user_id=str(uuid.uuid4()), 
-    )
-
-    recipients = Recipients(signers=[signer])
-
-    envelope_definition = EnvelopeDefinition(
-        status="sent",
-        template_id=DOCUSIGN_CONFIG["template_id"],
-        recipients=recipients
-    )
-    return envelope_definition
 
 @app.post("/create-signing-session", response_model=SigningSessionResponse)
 async def create_signing_session(
@@ -299,6 +282,151 @@ def create_envelope_from_template(signer_info: SignerInfo) -> EnvelopeDefinition
     # ]
     
     return envelope_definition
+
+@app.post("/docusign-webhook")
+async def handle_docusign_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks
+):
+    """
+    Receives webhook notifications from DocuSign when envelope status changes.
+    This is the PUSH mechanism - DocuSign tells us immediately when something happens.
+    
+    Webhooks are superior to polling because:
+    1. They provide real-time updates (no delay)
+    2. They reduce API calls (no constant checking)
+    3. They capture all events (can't miss status changes between polls)
+    """
+    try:
+        # Step 1: Verify the webhook is actually from DocuSign
+        # This prevents malicious actors from spoofing status updates
+        if DOCUSIGN_CONFIG.get("webhook_secret"):
+            await verify_webhook_signature(request)
+        
+        # Step 2: Parse the webhook payload
+        body = await request.body()
+        webhook_data = json.loads(body)
+        
+        # DocuSign sends events in a specific structure
+        event_type = webhook_data.get("event")
+        envelope_id = webhook_data.get("data", {}).get("envelopeId")
+        
+        logger.info(f"Received webhook: {event_type} for envelope {envelope_id}")
+        
+        # Step 3: Handle different event types
+        # DocuSign sends many events, but we care most about completion statuses
+        if event_type == "envelope-completed":
+            await handle_envelope_completed(envelope_id, webhook_data)
+        elif event_type == "envelope-declined":
+            await handle_envelope_declined(envelope_id, webhook_data)
+        elif event_type == "envelope-voided":
+            await handle_envelope_voided(envelope_id, webhook_data)
+        elif event_type == "recipient-completed":
+            # Individual recipient completed (useful for multi-signer flows)
+            logger.info(f"Recipient completed signing for envelope {envelope_id}")
+        
+        # Step 4: Process any background tasks (like sending emails) asynchronously
+        # This ensures the webhook response is fast, which DocuSign requires
+        # background_tasks.add_task(send_completion_email, envelope_id)
+        
+        # Always return 200 OK quickly to acknowledge receipt
+        # If you don't, DocuSign will retry the webhook
+        return {"message": "Webhook processed successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}")
+        # Still return 200 to prevent webhook retries for bad data
+        return {"message": "Webhook received"}
+
+async def verify_webhook_signature(request: Request):
+    """
+    Verifies that the webhook actually came from DocuSign using HMAC signature.
+    This is critical for security - never trust webhooks without verification!
+    """
+    # Get the signature from headers
+    signature = request.headers.get("X-DocuSign-Signature-1")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing webhook signature")
+    
+    # Recreate the signature using the shared secret
+    body = await request.body()
+    webhook_secret = DOCUSIGN_CONFIG.get("webhook_secret")
+    if webhook_secret is None:
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+    expected_signature = hmac.new(
+        webhook_secret.encode(),
+        body,
+        hashlib.sha256
+    ).hexdigest()
+    
+    # Compare signatures (use hmac.compare_digest to prevent timing attacks)
+    if not hmac.compare_digest(signature, expected_signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+async def handle_envelope_completed(envelope_id: str, webhook_data: dict):
+    """
+    Handles the envelope-completed event.
+    This is called when all recipients have finished signing.
+    """
+    session_id = envelope_to_session.get(envelope_id)
+    if not session_id:
+        logger.warning(f"Received webhook for unknown envelope {envelope_id}")
+        return
+    
+    # Update the session status
+    if session_id in signing_sessions:
+        signing_sessions[session_id]["status"] = EnvelopeStatus.COMPLETED
+        signing_sessions[session_id]["signed_at"] = datetime.utcnow()
+        signing_sessions[session_id]["documents_available"] = True
+        logger.info(f"Marked session {session_id} as completed")
+
+async def handle_envelope_declined(envelope_id: str, webhook_data: dict):
+    """
+    Handles when a signer declines to sign.
+    This is important for user experience - the frontend needs to know why signing failed.
+    """
+    session_id = envelope_to_session.get(envelope_id)
+    if session_id and session_id in signing_sessions:
+        signing_sessions[session_id]["status"] = EnvelopeStatus.DECLINED
+        signing_sessions[session_id]["declined_at"] = datetime.utcnow()
+        signing_sessions[session_id]["decline_reason"] = webhook_data.get("data", {}).get("declineReason", "No reason provided")
+
+async def handle_envelope_voided(envelope_id: str, webhook_data: dict):
+    """
+    Handles when an envelope is voided (cancelled).
+    This might happen if the sender realizes they sent the wrong document.
+    """
+    session_id = envelope_to_session.get(envelope_id)
+    if session_id and session_id in signing_sessions:
+        signing_sessions[session_id]["status"] = EnvelopeStatus.VOIDED
+        signing_sessions[session_id]["voided_at"] = datetime.utcnow()
+
+@app.get("/signing-status/{session_id}", response_model=SigningStatusResponse)
+async def get_signing_status(session_id: str):
+    """
+    Polling endpoint for the frontend to check signing status.
+    
+    Why do we need polling when we have webhooks?
+    1. Webhooks might fail or be delayed
+    2. The frontend needs immediate feedback
+    3. Network issues might prevent webhook delivery
+    4. It provides a backup mechanism for reliability
+    
+    The frontend typically polls this every few seconds while waiting for signing.
+    """
+    session_data = signing_sessions.get(session_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return SigningStatusResponse(
+        session_id=session_id,
+        envelope_id=session_data["envelope_id"],
+        status=session_data["status"],
+        signed_at=session_data.get("signed_at"),
+        declined_at=session_data.get("declined_at"),
+        decline_reason=session_data.get("decline_reason"),
+        documents_available=session_data.get("documents_available", False)
+    )
 
 @app.get("/health")
 async def health_check():
