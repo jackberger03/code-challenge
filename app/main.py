@@ -6,15 +6,15 @@ from typing import Optional, Dict, Any, cast
 import os 
 from datetime import datetime, timedelta
 import logging 
-from docusign_esign import ApiClient, EnvelopesApi, EnvelopeDefinition, Document, Signer, SignHere, Tabs, Recipients, RecipientViewRequest
+from docusign_esign import EnvelopeSummary, ApiClient, EnvelopesApi, EnvelopeDefinition, Document, Signer, SignHere, Tabs, Recipients, RecipientViewRequest
 from docusign_esign.client.api_exception import ApiException
-import base64
 import uuid
 import hmac 
 import hashlib
-from enum import Enum
 import json
-import io 
+import io
+
+from app.models import EnvelopeStatus, SigningSessionResponse, SigningStatusResponse 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -66,42 +66,7 @@ class SignerInfo(BaseModel):
             raise ValueError("Phone must be at least 10 digits long")
         return value
     
-# Enum for envelope statuses - makes code more readable and prevents typos
-class EnvelopeStatus(str, Enum):
-    CREATED = "created"
-    SENT = "sent"
-    DELIVERED = "delivered"
-    SIGNED = "signed"
-    COMPLETED = "completed"
-    DECLINED = "declined"
-    VOIDED = "voided"
-    
-class SigningSessionResponse(BaseModel): 
-    """Response model for signing session creation."""
-    signing_url: str
-    session_id: str 
-    envelope_id: str
-    expires_at: datetime
 
-class SigningStatusResponse(BaseModel):
-    """Response model for signing session status."""
-    session_id: str
-    envelope_id: str
-    status: EnvelopeStatus
-    signed_at: Optional[datetime] = None
-    declined_at: Optional[datetime] = None
-    decline_reason: Optional[str] = None
-    documents_available: bool = False
-
-class WebhookEvent(BaseModel):
-    """Model for webhook events from DocuSign."""
-    event: str
-    apiVersion: str
-    uri: str
-    retryCount: int
-    configurationId: int
-    generatedDateTime: datetime
-    data: Dict[str, Any]
 
 class TokenManager:
     """
@@ -183,17 +148,24 @@ async def create_signing_session(
 ):
     """Creates a signing session for the specified signer."""
     try: 
+        # Generate a unique session ID for tracking
         session_id = str(uuid.uuid4())
         logger.info(f"Creating signing session with ID: {session_id} for signer {signer_info.email}")
 
+        # Create the envelope definition using a template
         envelope_definition = create_envelope_from_template(signer_info)
 
-        envelope_summary = envelopes_api.create_envelope(
+        # Create the envelope in DocuSign
+        envelope_summary: EnvelopeSummary = envelopes_api.create_envelope(
             account_id=DOCUSIGN_CONFIG["account_id"],
             envelope_definition=envelope_definition
         )
         envelope_id = envelope_summary.envelope_id  
         logger.info(f"Envelope created with ID: {envelope_id}")
+
+        if envelope_id is None:
+            logger.error("Envelope ID is None after envelope creation")
+            raise HTTPException(status_code=500, detail="Failed to create envelope: envelope_id is None")
 
         recipient_view_request = RecipientViewRequest(
             authentication_method="none",  # handling auth at the app level
@@ -465,7 +437,137 @@ async def download_signed_document(
         logger.error(f"Failed to download document: {e.body}")
         raise HTTPException(status_code=500, detail="Failed to retrieve document")
 
+@app.get("/signing-complete")
+async def handle_signing_redirect(
+    event: str = "signing_complete",
+    session_id: Optional[str] = None,
+    envelope_id: Optional[str] = None
+):
+    """
+    Handles the redirect from DocuSign after signing is complete.
+    This is where users land after they finish (or cancel) signing.
+    
+    DocuSign adds query parameters to indicate what happened:
+    - event=signing_complete: Successfully signed
+    - event=cancel: User cancelled
+    - event=decline: User declined to sign
+    - event=ttl_expired: Signing link expired
+    """
+    # In a real app, you'd redirect to your frontend with status info
+    # For this demo, we'll return a simple HTML page
+    
+    status_message = {
+        "signing_complete": "Thank you for signing! You can now close this window.",
+        "cancel": "Signing was cancelled. You can close this window and try again.",
+        "decline": "You declined to sign the document.",
+        "ttl_expired": "The signing session expired. Please request a new signing link.",
+    }.get(event, "Signing session ended.")
+    
+    # Simple HTML response - in production, redirect to your React/Vue/etc frontend
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Signing Complete</title>
+        <style>
+            body {{ 
+                font-family: Arial, sans-serif; 
+                display: flex; 
+                justify-content: center; 
+                align-items: center; 
+                height: 100vh; 
+                margin: 0;
+                background-color: #f5f5f5;
+            }}
+            .message-box {{
+                text-align: center;
+                padding: 40px;
+                background: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }}
+            .status-{event} {{ color: {"#28a745" if event == "signing_complete" else "#dc3545"}; }}
+        </style>
+        <script>
+            // Notify parent window (if in iframe) that signing is complete
+            if (window.parent !== window) {{
+                window.parent.postMessage({{
+                    type: 'docusign-signing-complete',
+                    event: '{event}',
+                    sessionId: '{session_id or ""}',
+                    envelopeId: '{envelope_id or ""}'
+                }}, '*');
+            }}
+        </script>
+    </head>
+    <body>
+        <div class="message-box">
+            <h2 class="status-{event}">{status_message}</h2>
+            <p>Session ID: {session_id or 'Not provided'}</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=html_content)
 
+@app.get("/sync-envelope-status/{session_id}")
+async def sync_envelope_status(
+    session_id: str,
+    envelopes_api: EnvelopesApi = Depends(get_envelopes_api)
+):
+    """
+    Synchronizes envelope status by querying DocuSign directly.
+    Use this as a fallback if webhooks fail or status seems incorrect.
+    
+    This demonstrates the "trust but verify" principle - while we maintain
+    our own status tracking for performance, we can always check the
+    source of truth (DocuSign) when needed.
+    """
+    session_data = signing_sessions.get(session_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    try:
+        # Query DocuSign for the current envelope status
+        envelope = envelopes_api.get_envelope(
+            account_id=DOCUSIGN_CONFIG["account_id"],
+            envelope_id=session_data["envelope_id"]
+        )
+        
+        # Map DocuSign status to our enum
+        status_mapping = {
+            "created": EnvelopeStatus.CREATED,
+            "sent": EnvelopeStatus.SENT,
+            "delivered": EnvelopeStatus.DELIVERED,
+            "signed": EnvelopeStatus.SIGNED,
+            "completed": EnvelopeStatus.COMPLETED,
+            "declined": EnvelopeStatus.DECLINED,
+            "voided": EnvelopeStatus.VOIDED
+        }
+        
+        new_status = status_mapping.get(envelope.status, EnvelopeStatus.SENT)
+        
+        # Update our local cache with the authoritative status
+        signing_sessions[session_id]["status"] = new_status
+        if new_status == EnvelopeStatus.COMPLETED:
+            signing_sessions[session_id]["signed_at"] = envelope.completed_date_time
+            signing_sessions[session_id]["documents_available"] = True
+        
+        logger.info(f"Synchronized status for session {session_id}: {new_status}")
+        
+        return {
+            "session_id": session_id,
+            "envelope_id": session_data["envelope_id"],
+            "status": new_status,
+            "last_sync": datetime.utcnow()
+        }
+        
+    except ApiException as e:
+        logger.error(f"Failed to sync status: {e.body}")
+        raise HTTPException(status_code=500, detail="Failed to sync status with DocuSign")
+    
 @app.get("/health")
 async def health_check():
     """
@@ -473,3 +575,8 @@ async def health_check():
     In production, you might also check DocuSign connectivity here.
     """
     return {"status": "healthy", "service": "DocuSign Signing Service"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+   
