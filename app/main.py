@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, cast
 import os 
 from datetime import datetime, timedelta
 import logging 
-from docusign_esign import ApiClient, EnvelopesApi, EnvelopeDefinition, Document, Signer, SignHere, Tabs, RecipientViewRequest
+from docusign_esign import ApiClient, EnvelopesApi, EnvelopeDefinition, Document, Signer, SignHere, Tabs, Recipients, RecipientViewRequest
 from docusign_esign.client.api_exception import ApiException
 import base64
 import uuid
@@ -175,11 +175,86 @@ def get_envelopes_api() -> EnvelopesApi:
     api_client = token_manager.get_api_client()
     return EnvelopesApi(api_client)
 
+def create_envelope_from_template(signer_info: SignerInfo) -> EnvelopeDefinition:
+    signer = Signer(
+        email=signer_info.email,
+        name=signer_info.name,
+        recipient_id="1",
+        routing_order="1",
+        client_user_id=str(uuid.uuid4()), 
+    )
+
+    recipients = Recipients(signers=[signer])
+
+    envelope_definition = EnvelopeDefinition(
+        status="sent",
+        template_id=DOCUSIGN_CONFIG["template_id"],
+        recipients=recipients
+    )
+    return envelope_definition
+
 @app.post("/create-signing-session", response_model=SigningSessionResponse)
 async def create_signing_session(
     signer_info: SignerInfo, 
     envelopes_api: EnvelopesApi = Depends(get_envelopes_api)
 ):
     """Creates a signing session for the specified signer."""
+    try: 
+        session_id = str(uuid.uuid4())
+        logger.info(f"Creating signing session with ID: {session_id} for signer {signer_info.email}")
 
-    # TODO
+        envelope_definition = create_envelope_from_template(signer_info)
+
+        envelope_summary = envelopes_api.create_envelope(
+            account_id=DOCUSIGN_CONFIG["account_id"],
+            envelope_definition=envelope_definition
+        )
+        envelope_id = envelope_summary.envelope_id  
+        logger.info(f"Envelope created with ID: {envelope_id}")
+
+        recipient_view_request = RecipientViewRequest(
+            authentication_method="none",  # handling auth at the app level
+            client_user_id=session_id,  # Links this view to our signer
+            recipient_id="1",  # Must match the recipient ID in the envelope
+            return_url=DOCUSIGN_CONFIG["redirect_url"],
+            user_name=signer_info.name,
+            email=signer_info.email
+        )
+
+        recipient_view = envelopes_api.create_recipient_view(
+            account_id=DOCUSIGN_CONFIG["account_id"],
+            envelope_id=envelope_id,
+            recipient_view_request=recipient_view_request
+        )
+
+        expires_at = datetime.now() + timedelta(minutes=5)  # Session valid for 5 minutes
+
+        session_data = {
+            "session_id": session_id,
+            "envelope_id": envelope_id,
+            "signer_info": signer_info.model_dump(),
+            "status": EnvelopeStatus.SENT,
+            "created_at": datetime.now(),
+            "expires_at": expires_at,
+            "signing_url": recipient_view.url
+        }
+
+        # Store in our in-memory database
+        signing_sessions[session_id] = session_data
+        envelope_to_session[envelope_id] = session_id  # For webhook lookups
+        
+        logger.info(f"Successfully created signing URL for session {session_id}")
+        
+        return SigningSessionResponse(
+            signing_url=recipient_view.url,
+            session_id=session_id,
+            envelope_id=envelope_id,
+            expires_at=expires_at
+        )
+    
+    except ApiException as e:
+        logger.error(f"DocuSign API error: {e.body}")
+        raise HTTPException(status_code=e.status if e.status is not None else 500, detail=f"DocuSign error: {e.reason}")
+    except Exception as e:
+        logger.error(f"Unexpected error in create_signing_session: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create signing session")
