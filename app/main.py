@@ -428,6 +428,44 @@ async def get_signing_status(session_id: str):
         documents_available=session_data.get("documents_available", False)
     )
 
+@app.get("/download-document/{session_id}")
+async def download_signed_document(
+    session_id: str,
+    envelopes_api: EnvelopesApi = Depends(get_envelopes_api)
+):
+    """
+    Downloads the completed signed document.
+    This is the final step - delivering the signed document to the user.
+    """
+    session_data = signing_sessions.get(session_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session_data["status"] != EnvelopeStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Document not yet signed")
+    
+    try:
+        # combined=true merges all documents into a single PDF
+        document_response = envelopes_api.get_document(
+            account_id=DOCUSIGN_CONFIG["account_id"],
+            envelope_id=session_data["envelope_id"],
+            document_id="combined"  # Gets all documents in one PDF
+        )
+        
+        # Using StreamingResponse is memory-efficient for large files
+        return StreamingResponse(
+            io.BytesIO(document_response),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename=signed_document_{session_id}.pdf"
+            }
+        )
+        
+    except ApiException as e:
+        logger.error(f"Failed to download document: {e.body}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve document")
+
+
 @app.get("/health")
 async def health_check():
     """
