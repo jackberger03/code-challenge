@@ -13,8 +13,10 @@ import hmac
 import hashlib
 import json
 import io
-
 from app.models import EnvelopeStatus, SigningSessionResponse, SigningStatusResponse 
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +34,8 @@ DOCUSIGN_CONFIG = {
     "redirect_uri": os.getenv("DOCUSIGN_REDIRECT_URI"),
     "webhook_secret": os.getenv("DOCUSIGN_WEBHOOK_SECRET"),
 }
+
+logger.info(f"DocuSign configuration loaded: {DOCUSIGN_CONFIG}")
 
 signing_sessions: Dict[str, Dict[str, Any]] = {}
 envelope_to_session: Dict[str, str] = {}
