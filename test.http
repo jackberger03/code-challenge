@@ -5,13 +5,12 @@ Content-Type: application/json
 {
     "email": "john.doe@example.com",
     "name": "John",
-    "role_name": "signer",
+    "role_name": "Hiring Manager",
     "phone": "5125551234"
 }
 
 ###
-# If you want, you can add more requests here for additional manual testing,
-# like GET /health, etc.
+
 
 # Health check (optional, confirms the backend is running)
 GET http://localhost:8000/health

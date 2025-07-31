@@ -1,13 +1,12 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
-from typing import Optional, Dict, Any, cast
+from typing import Optional, Dict, Any, List
 import os 
 from datetime import datetime, timedelta
 import logging 
-from docusign_esign import EnvelopeSummary, ApiClient, EnvelopesApi, EnvelopeDefinition, Document, Signer, SignHere, Tabs, Recipients, RecipientViewRequest
-from docusign_esign.client.api_exception import ApiException
+import requests
 import uuid
 import hmac 
 import hashlib
@@ -18,32 +17,31 @@ from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env file
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-DOCUSIGN_CONFIG = {
-    "integration_key": os.getenv("DOCUSIGN_INTEGRATION_KEY"),
-    "user_id": os.getenv("DOCUSIGN_USER_ID"),
-    "account_id": os.getenv("DOCUSIGN_ACCOUNT_ID"),
-    "base_path": os.getenv("DOCUSIGN_BASE_PATH"),
-    "oauth_base_path": os.getenv("DOCUSIGN_OAUTH_BASE_PATH"),
-    "private_key_path": os.getenv("DOCUSIGN_PRIVATE_KEY_PATH"),
-    "template_id": os.getenv("DOCUSIGN_TEMPLATE_ID"),
-    "redirect_uri": os.getenv("DOCUSIGN_REDIRECT_URI"),
-    "webhook_secret": os.getenv("DOCUSIGN_WEBHOOK_SECRET"),
+# Dropbox Sign configuration
+DROPBOX_SIGN_CONFIG = {
+    "api_key": os.getenv("DROPBOX_SIGN_API_KEY"),
+    "client_id": os.getenv("DROPBOX_SIGN_CLIENT_ID"),
+    "template_id": os.getenv("DROPBOX_SIGN_TEMPLATE_ID"),
+    "test_mode": os.getenv("DROPBOX_SIGN_TEST_MODE", "true").lower() == "true",
+    "callback_url": os.getenv("DROPBOX_SIGN_CALLBACK_URL"),
+    "api_base_url": os.getenv("DROPBOX_SIGN_API_BASE_URL", "https://api.hellosign.com/v3"),
 }
 
-logger.info(f"DocuSign configuration loaded: {DOCUSIGN_CONFIG}")
+logger.info(f"Dropbox Sign configuration loaded: {DROPBOX_SIGN_CONFIG}")
 
+# Session storage remains the same
 signing_sessions: Dict[str, Dict[str, Any]] = {}
-envelope_to_session: Dict[str, str] = {}
+signature_request_to_session: Dict[str, str] = {}  # Maps signature_request_id to session_id
 
 class SignerInfo(BaseModel):
     email: EmailStr
     name: str
-    role_name: str
+    role_name: str  # This will map to "role" in Dropbox Sign
     phone: Optional[str] = None
 
     @field_validator('name')
@@ -54,325 +52,248 @@ class SignerInfo(BaseModel):
             raise ValueError("Name must not be empty")
         if len(value) < 2:
             raise ValueError("Name must be at least 2 characters long")
-        if not value.isalpha():
-            raise ValueError("Name must contain only alphabetic characters")
-        return value
+        # Dropbox Sign accepts names with spaces
+        return value.strip()
 
     @field_validator('phone')
     @classmethod
     def phone_basic_validation(cls, value: Optional[str]) -> Optional[str]:
-        """Basic phone validation to ensure it is not empty."""
+        """Basic phone validation."""
         if value and not value.strip():
             raise ValueError("Phone must not be empty")
-        if value and not value.isdigit():
-            raise ValueError("Phone must contain only digits")
         if value and len(value) < 10:
-            raise ValueError("Phone must be at least 10 digits long")
+            raise ValueError("Phone must be at least 10 characters long")
         return value
+
+def get_auth_headers() -> Dict[str, str]:
+    """
+    Get headers for Dropbox Sign API authentication.
+    Using API key authentication which is simpler than OAuth for server-to-server.
+    """
+    # Dropbox Sign uses Basic auth with API key as username, no password
+    import base64
+    auth_string = f"{DROPBOX_SIGN_CONFIG['api_key']}:"
+    encoded_auth = base64.b64encode(auth_string.encode()).decode()
     
-
-
-class TokenManager:
-    """
-    Manages DocuSign OAuth tokens with automatic refresh.
-    This implements the strategy we discussed about handling authentication efficiently.
-    """
-    def __init__(self):
-        self._token: Optional[str] = None
-        self._token_expires_at: Optional[datetime] = None
-        self._api_client: Optional[ApiClient] = None
-    
-    def get_api_client(self) -> ApiClient:
-        """
-        Returns an authenticated API client, refreshing the token if necessary.
-        This method implements smart token management - only authenticating when needed.
-        """
-        # Check if we need a new token (first time or expired)
-        if not self._token or not self._token_expires_at or datetime.utcnow() >= self._token_expires_at:
-            logger.info("Obtaining new DocuSign access token...")
-            self._refresh_token()
-        assert self._api_client is not None
-        return self._api_client
-    
-    def _refresh_token(self):
-        """
-        Obtains a new access token using JWT authentication.
-        DocuSign's JWT flow is perfect for server applications.
-        """
-        api_client = ApiClient()
-        api_client.set_base_path(DOCUSIGN_CONFIG["base_path"])
-        private_key_path = DOCUSIGN_CONFIG["private_key_path"]
-        if private_key_path is None:
-            raise RuntimeError("DOCUSIGN_PRIVATE_KEY_PATH env var not set")
-
-        with open(private_key_path, "rb") as key_file:
-            private_key = key_file.read()
-        
-        try:
-            # Request token with 1 hour lifetime (3600 seconds)
-            token_response: Any = api_client.request_jwt_user_token(
-                client_id=DOCUSIGN_CONFIG["integration_key"],
-                user_id=DOCUSIGN_CONFIG["user_id"],
-                oauth_host_name=DOCUSIGN_CONFIG["oauth_base_path"],
-                private_key_bytes=private_key,
-                expires_in=3600,
-                scopes=["signature", "impersonation"]
-            )
-            
-            # Store the token and calculate expiration (subtract 5 minutes for safety margin)
-            self._token = cast(str, token_response.access_token)
-            self._token_expires_at = datetime.now() + timedelta(seconds=3600 - 300)
-            
-            # Configure the API client with the new token
-            self._api_client = api_client
-            self._api_client.set_default_header("Authorization", f"Bearer {self._token}")
-            
-            logger.info("Successfully obtained new access token")
-            
-        except Exception as e:
-            logger.error(f"Failed to obtain access token: {str(e)}")
-            raise HTTPException(status_code=500, detail="Authentication with DocuSign failed")
-
-# Create a singleton token manager instance
-token_manager = TokenManager()
-
-def get_envelopes_api() -> EnvelopesApi:
-    """
-    Dependency to get an authenticated EnvelopesApi instance.
-    This ensures we reuse the token efficiently across requests.
-    """
-    api_client = token_manager.get_api_client()
-    return EnvelopesApi(api_client)
-
+    return {
+        "Authorization": f"Basic {encoded_auth}",
+        "Content-Type": "application/json"
+    }
 
 @app.post("/create-signing-session", response_model=SigningSessionResponse)
 async def create_signing_session(
-    signer_info: SignerInfo, 
-    envelopes_api: EnvelopesApi = Depends(get_envelopes_api)
+    signer_info: SignerInfo,
+    auth_headers: Dict[str, str] = Depends(get_auth_headers)
 ):
-    """Creates a signing session for the specified signer."""
-    try: 
-        # Generate a unique session ID for tracking
+    """
+    Creates a signing session using Dropbox Sign embedded signing.
+    This replaces the DocuSign envelope creation flow.
+    """
+    logger.info(f"[1] Received /create-signing-session for email={signer_info.email}, role={signer_info.role_name}")
+    try:
         session_id = str(uuid.uuid4())
-        logger.info(f"Creating signing session with ID: {session_id} for signer {signer_info.email}")
+        logger.info(f"Creating signing session {session_id} for {signer_info.email}")
+        
+        # Step 1: Create embedded signature request from template
+        # This is similar to creating an envelope in DocuSign
+        create_url = f"{DROPBOX_SIGN_CONFIG['api_base_url']}/signature_request/create_embedded_with_template"
+        
+        # Prepare signers list
+        signers = [{
+            "role": signer_info.role_name,  # Must match role in template
+            "name": signer_info.name,
+            "email_address": signer_info.email,
+            "pin": None,  # Optional PIN for extra security
+            "sms_phone_number": signer_info.phone if signer_info.phone else None
+        }]
+        
+        # Create the signature request
+        request_data = {
+            "client_id": DROPBOX_SIGN_CONFIG["client_id"],
+            "template_ids": [DROPBOX_SIGN_CONFIG["template_id"]],
+            "subject": "Please sign this document",
+            "message": "Thanks for your business. Please review and sign the attached document.",
+            "signers": signers,
+            "test_mode": DROPBOX_SIGN_CONFIG["test_mode"],
+            "is_for_embedded_signing": True
+        }
+        
+        # For form data, Dropbox Sign expects a different format
+        form_data = {
+            "client_id": DROPBOX_SIGN_CONFIG["client_id"],
+            "template_ids[0]": DROPBOX_SIGN_CONFIG["template_id"],
+            "signers[0][role]": signer_info.role_name,    # should be "Hiring Manager"
+            "signers[0][name]": signer_info.name,
+            "signers[0][email_address]": signer_info.email,
+            "test_mode": "1" if DROPBOX_SIGN_CONFIG["test_mode"] else "0",
+            "custom_fields[full_name]": signer_info.name,
+            "custom_fields[phone number]": signer_info.phone or "",
+        }
+        logger.debug(f"[2] Building Dropbox Sign API payload: form_data={form_data}")
+        
+        # Use form data for this endpoint
+        headers = {
+            "Authorization": auth_headers["Authorization"]
+        }
+        logger.info(f"[3] Sending POST to Dropbox Sign: {create_url}")
+        response = requests.post(create_url, data=form_data, headers=headers)
+        response.raise_for_status()
+        
+        result = response.json()
+        logger.debug(f"[3.1] Dropbox Sign response: {response.status_code} {response.text}")
 
-        # Create the envelope definition using a template
-        envelope_definition = create_envelope_from_template(signer_info)
 
-        # Create the envelope in DocuSign
-        envelope_summary: EnvelopeSummary = envelopes_api.create_envelope(
-            account_id=DOCUSIGN_CONFIG["account_id"],
-            envelope_definition=envelope_definition
-        )
-        envelope_id = envelope_summary.envelope_id  
-        logger.info(f"Envelope created with ID: {envelope_id}")
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"]["error_msg"])
+        
+        signature_request = result["signature_request"]
+        signature_request_id = signature_request["signature_request_id"]
+        logger.info(f"[4] Received signature_request_id={signature_request_id} from Dropbox Sign")
+        
+        # Step 2: Get the embedded sign URL for the signer
+        # Find the signature_id for our signer
+        signatures = signature_request.get("signatures", [])
+        if not signatures:
+            raise HTTPException(status_code=500, detail="No signatures found in response")
+        
+        signature_id = signatures[0]["signature_id"]
+        
+        # Get embedded sign URL
+        sign_url_endpoint = f"{DROPBOX_SIGN_CONFIG['api_base_url']}/embedded/sign_url/{signature_id}"
+        logger.info(f"[5] Getting embedded sign URL for signature_id={signature_id}")
 
-        if envelope_id is None:
-            logger.error("Envelope ID is None after envelope creation")
-            raise HTTPException(status_code=500, detail="Failed to create envelope: envelope_id is None")
-
-        recipient_view_request = RecipientViewRequest(
-            authentication_method="none",  # handling auth at the app level
-            client_user_id=session_id,  # Links this view to our signer
-            recipient_id="1",  # Must match the recipient ID in the envelope
-            return_url=DOCUSIGN_CONFIG["redirect_url"],
-            user_name=signer_info.name,
-            email=signer_info.email
-        )
-
-        recipient_view = envelopes_api.create_recipient_view(
-            account_id=DOCUSIGN_CONFIG["account_id"],
-            envelope_id=envelope_id,
-            recipient_view_request=recipient_view_request
-        )
-
-        expires_at = datetime.now() + timedelta(minutes=5)  # Session valid for 5 minutes
-
+        sign_url_response = requests.get(sign_url_endpoint, headers=auth_headers)
+        sign_url_response.raise_for_status()
+        
+        sign_url_result = sign_url_response.json()
+        logger.debug(f"[5.1] Embedded sign URL response: {sign_url_response.status_code} {sign_url_response.text}")
+        
+        if "error" in sign_url_result:
+            raise HTTPException(status_code=400, detail=sign_url_result["error"]["error_msg"])
+        
+        embedded_sign_url = sign_url_result["embedded"]["sign_url"]
+        expires_at = datetime.now() + timedelta(minutes=60)  # Dropbox Sign URLs last longer
+        
+        # Store session data
         session_data = {
             "session_id": session_id,
-            "envelope_id": envelope_id,
+            "signature_request_id": signature_request_id,  # This is like envelope_id
+            "signature_id": signature_id,
             "signer_info": signer_info.model_dump(),
             "status": EnvelopeStatus.SENT,
             "created_at": datetime.now(),
             "expires_at": expires_at,
-            "signing_url": recipient_view.url
+            "signing_url": embedded_sign_url
         }
-
-        # Store in our in-memory database
+        
         signing_sessions[session_id] = session_data
-        envelope_to_session[envelope_id] = session_id  # For webhook lookups
+        signature_request_to_session[signature_request_id] = session_id
+        logger.info(f"[6] Caching signing session with session_id={session_id}, signature_request_id={signature_request_id}")
         
         logger.info(f"Successfully created signing URL for session {session_id}")
         
+        # Return response (using envelope_id for backward compatibility)
+        logger.info(f"[7] Returning signing URL for session_id={session_id}")
         return SigningSessionResponse(
-            signing_url=recipient_view.url,
+            signing_url=embedded_sign_url,
             session_id=session_id,
-            envelope_id=envelope_id,
+            envelope_id=signature_request_id,  # Maps to signature_request_id
             expires_at=expires_at
         )
-    
-    except ApiException as e:
-        logger.error(f"DocuSign API error: {e.body}")
-        raise HTTPException(status_code=e.status if e.status is not None else 500, detail=f"DocuSign error: {e.reason}")
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Dropbox Sign API error: {str(e)}")
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_data = e.response.json()
+                error_msg = error_data.get("error", {}).get("error_msg", str(e))
+            except:
+                error_msg = e.response.text
+        else:
+            error_msg = str(e)
+        raise HTTPException(status_code=500, detail=f"Dropbox Sign error: {error_msg}")
     except Exception as e:
-        logger.error(f"Unexpected error in create_signing_session: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to create signing session")
-    
-def create_envelope_from_template(signer_info: SignerInfo) -> EnvelopeDefinition:
-    """
-    Creates an envelope definition using a DocuSign template.
-    Templates are pre-made documents with placeholder fields - perfect for repeated use.
-    """
-    # Create the signer object with the user's information
-    signer = Signer(
-        email=signer_info.email,
-        name=signer_info.name,
-        recipient_id="1",  # Identifies this recipient in the envelope
-        routing_order="1",  # Order in which recipients sign (important for multiple signers)
-        client_user_id=str(uuid.uuid4())  # Links this signer to the embedded view
-    )
-    
-    # Package the signer into a recipients object
-    recipients = Recipients(signers=[signer])
-    
-    # Create the envelope definition
-    envelope_definition = EnvelopeDefinition(
-        template_id=DOCUSIGN_CONFIG["template_id"],
-        recipients=recipients,
-        status="sent",  # "sent" means ready for signing, "created" would save as draft
-        email_subject="Please sign this document",
-        email_blurb="Thanks for your business. Please review and sign the attached document."
-    )
-    
-    # to pre-fill template fields with data, add template roles:
-    # envelope_definition.template_roles = [
-    #     TemplateRole(
-    #         email=signer_info.email,
-    #         name=signer_info.name,
-    #         role_name="signer",  # Must match the role name in your template
-    #         tabs=TextTabs(text_tabs=[
-    #             Text(tab_label="phone", value=signer_info.phone),
-    #             Text(tab_label="address", value="123 Main St")
-    #         ])
-    #     )
-    # ]
-    
-    return envelope_definition
 
-@app.post("/docusign-webhook")
-async def handle_docusign_webhook(
+@app.post("/dropbox-sign-callback")
+async def handle_dropbox_sign_callback(
     request: Request,
     background_tasks: BackgroundTasks
 ):
     """
-    Receives webhook notifications from DocuSign when envelope status changes.
-    This is the PUSH mechanism - DocuSign tells us immediately when something happens.
-    
-    Webhooks are superior to polling because:
-    1. They provide real-time updates (no delay)
-    2. They reduce API calls (no constant checking)
-    3. They capture all events (can't miss status changes between polls)
+    Handles callbacks from Dropbox Sign for signature request events.
+    Dropbox Sign sends webhook events to notify about document status changes 
     """
     try:
-        # Step 1: Verify the webhook is actually from DocuSign
-        # This prevents malicious actors from spoofing status updates
-        if DOCUSIGN_CONFIG.get("webhook_secret"):
-            await verify_webhook_signature(request)
-        
-        # Step 2: Parse the webhook payload
+        # Parse the callback data
         body = await request.body()
-        webhook_data = json.loads(body)
+        form_data = await request.form()
         
-        # DocuSign sends events in a specific structure
-        event_type = webhook_data.get("event")
-        envelope_id = webhook_data.get("data", {}).get("envelopeId")
+        # Dropbox Sign sends JSON in the 'json' field of form data
+        json_data = form_data.get("json")
+        if json_data:
+            event_data = json.loads(json_data)
+        else:
+            # Fallback to raw body parsing
+            event_data = json.loads(body)
         
-        logger.info(f"Received webhook: {event_type} for envelope {envelope_id}")
+        event_type = event_data.get("event", {}).get("event_type")
+        signature_request_id = event_data.get("signature_request", {}).get("signature_request_id")
         
-        # Step 3: Handle different event types
-        # DocuSign sends many events, but we care most about completion statuses
-        if event_type == "envelope-completed":
-            await handle_envelope_completed(envelope_id, webhook_data)
-        elif event_type == "envelope-declined":
-            await handle_envelope_declined(envelope_id, webhook_data)
-        elif event_type == "envelope-voided":
-            await handle_envelope_voided(envelope_id, webhook_data)
-        elif event_type == "recipient-completed":
-            # Individual recipient completed (useful for multi-signer flows)
-            logger.info(f"Recipient completed signing for envelope {envelope_id}")
+        logger.info(f"Received Dropbox Sign event: {event_type} for request {signature_request_id}")
         
-        # Step 4: Process any background tasks (like sending emails) asynchronously
-        # This ensures the webhook response is fast, which DocuSign requires
-        # background_tasks.add_task(send_completion_email, envelope_id)
+        # Handle different event types
+        if event_type == "signature_request_all_signed":
+            await handle_all_signed(signature_request_id, event_data)
+        elif event_type == "signature_request_signed":
+            await handle_signature_signed(signature_request_id, event_data)
+        elif event_type == "signature_request_declined":
+            await handle_signature_declined(signature_request_id, event_data)
+        elif event_type == "signature_request_canceled":
+            await handle_signature_canceled(signature_request_id, event_data)
         
-        # Always return 200 OK quickly to acknowledge receipt
-        # If you don't, DocuSign will retry the webhook
-        return {"message": "Webhook processed successfully"}
+        # Dropbox Sign expects a specific response
+        return JSONResponse(content={"HelloSign API Event Received": True})
         
     except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}")
-        # Still return 200 to prevent webhook retries for bad data
-        return {"message": "Webhook received"}
+        logger.error(f"Error processing callback: {str(e)}")
+        # Still return success to prevent retries
+        return JSONResponse(content={"HelloSign API Event Received": True})
 
-async def verify_webhook_signature(request: Request):
-    """
-    Verifies that the webhook actually came from DocuSign using HMAC signature.
-    This is critical for security - never trust webhooks without verification!
-    """
-    # Get the signature from headers
-    signature = request.headers.get("X-DocuSign-Signature-1")
-    if not signature:
-        raise HTTPException(status_code=401, detail="Missing webhook signature")
-    
-    # Recreate the signature using the shared secret
-    body = await request.body()
-    webhook_secret = DOCUSIGN_CONFIG.get("webhook_secret")
-    if webhook_secret is None:
-        raise HTTPException(status_code=500, detail="Webhook secret not configured")
-    expected_signature = hmac.new(
-        webhook_secret.encode(),
-        body,
-        hashlib.sha256
-    ).hexdigest()
-    
-    # Compare signatures (use hmac.compare_digest to prevent timing attacks)
-    if not hmac.compare_digest(signature, expected_signature):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
-async def handle_envelope_completed(envelope_id: str, webhook_data: dict):
-    """
-    Handles the envelope-completed event.
-    This is called when all recipients have finished signing.
-    """
-    session_id = envelope_to_session.get(envelope_id)
+async def handle_all_signed(signature_request_id: str, event_data: dict):
+    """Handle when all signers have completed signing."""
+    session_id = signature_request_to_session.get(signature_request_id)
     if not session_id:
-        logger.warning(f"Received webhook for unknown envelope {envelope_id}")
+        logger.warning(f"Received callback for unknown signature request {signature_request_id}")
         return
     
-    # Update the session status
     if session_id in signing_sessions:
         signing_sessions[session_id]["status"] = EnvelopeStatus.COMPLETED
         signing_sessions[session_id]["signed_at"] = datetime.utcnow()
         signing_sessions[session_id]["documents_available"] = True
         logger.info(f"Marked session {session_id} as completed")
 
-async def handle_envelope_declined(envelope_id: str, webhook_data: dict):
-    """
-    Handles when a signer declines to sign.
-    This is important for user experience - the frontend needs to know why signing failed.
-    """
-    session_id = envelope_to_session.get(envelope_id)
+async def handle_signature_signed(signature_request_id: str, event_data: dict):
+    """Handle when a single signer has signed (useful for multi-signer flows)."""
+    session_id = signature_request_to_session.get(signature_request_id)
+    if session_id and session_id in signing_sessions:
+        # Update status to show progress
+        signing_sessions[session_id]["last_signature_at"] = datetime.utcnow()
+        logger.info(f"Signature received for session {session_id}")
+
+async def handle_signature_declined(signature_request_id: str, event_data: dict):
+    """Handle when a signer declines to sign."""
+    session_id = signature_request_to_session.get(signature_request_id)
     if session_id and session_id in signing_sessions:
         signing_sessions[session_id]["status"] = EnvelopeStatus.DECLINED
         signing_sessions[session_id]["declined_at"] = datetime.utcnow()
-        signing_sessions[session_id]["decline_reason"] = webhook_data.get("data", {}).get("declineReason", "No reason provided")
+        decline_reason = event_data.get("signature_request", {}).get("response_data", {}).get("decline_reason", "No reason provided")
+        signing_sessions[session_id]["decline_reason"] = decline_reason
 
-async def handle_envelope_voided(envelope_id: str, webhook_data: dict):
-    """
-    Handles when an envelope is voided (cancelled).
-    This might happen if the sender realizes they sent the wrong document.
-    """
-    session_id = envelope_to_session.get(envelope_id)
+async def handle_signature_canceled(signature_request_id: str, event_data: dict):
+    """Handle when a signature request is canceled."""
+    session_id = signature_request_to_session.get(signature_request_id)
     if session_id and session_id in signing_sessions:
         signing_sessions[session_id]["status"] = EnvelopeStatus.VOIDED
         signing_sessions[session_id]["voided_at"] = datetime.utcnow()
@@ -380,15 +301,8 @@ async def handle_envelope_voided(envelope_id: str, webhook_data: dict):
 @app.get("/signing-status/{session_id}", response_model=SigningStatusResponse)
 async def get_signing_status(session_id: str):
     """
-    Polling endpoint for the frontend to check signing status.
-    
-    Why do we need polling when we have webhooks?
-    1. Webhooks might fail or be delayed
-    2. The frontend needs immediate feedback
-    3. Network issues might prevent webhook delivery
-    4. It provides a backup mechanism for reliability
-    
-    The frontend typically polls this every few seconds while waiting for signing.
+    Get the current status of a signing session.
+    This endpoint remains largely unchanged as it uses our local session storage.
     """
     session_data = signing_sessions.get(session_id)
     if not session_data:
@@ -396,7 +310,7 @@ async def get_signing_status(session_id: str):
     
     return SigningStatusResponse(
         session_id=session_id,
-        envelope_id=session_data["envelope_id"],
+        envelope_id=session_data["signature_request_id"],  # Maps to signature_request_id
         status=session_data["status"],
         signed_at=session_data.get("signed_at"),
         declined_at=session_data.get("declined_at"),
@@ -407,11 +321,10 @@ async def get_signing_status(session_id: str):
 @app.get("/download-document/{session_id}")
 async def download_signed_document(
     session_id: str,
-    envelopes_api: EnvelopesApi = Depends(get_envelopes_api)
+    auth_headers: Dict[str, str] = Depends(get_auth_headers)
 ):
     """
-    Downloads the completed signed document.
-    This is the final step - delivering the signed document to the user.
+    Download the completed signed document from Dropbox Sign.
     """
     session_data = signing_sessions.get(session_id)
     if not session_data:
@@ -421,53 +334,106 @@ async def download_signed_document(
         raise HTTPException(status_code=400, detail="Document not yet signed")
     
     try:
-        # combined=true merges all documents into a single PDF
-        document_response = envelopes_api.get_document(
-            account_id=DOCUSIGN_CONFIG["account_id"],
-            envelope_id=session_data["envelope_id"],
-            document_id="combined"  # Gets all documents in one PDF
-        )
+        # Download the signed document
+        signature_request_id = session_data["signature_request_id"]
+        download_url = f"{DROPBOX_SIGN_CONFIG['api_base_url']}/signature_request/download/{signature_request_id}"
         
-        # Using StreamingResponse is memory-efficient for large files
+        # Add file_type parameter to get PDF
+        params = {"file_type": "pdf"}
+        
+        response = requests.get(download_url, headers=auth_headers, params=params)
+        response.raise_for_status()
+        
         return StreamingResponse(
-            io.BytesIO(document_response),
+            io.BytesIO(response.content),
             media_type="application/pdf",
             headers={
                 "Content-Disposition": f"attachment; filename=signed_document_{session_id}.pdf"
             }
         )
         
-    except ApiException as e:
-        logger.error(f"Failed to download document: {e.body}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download document: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to retrieve document")
+
+@app.get("/sync-signing-status/{session_id}")
+async def sync_signing_status(
+    session_id: str,
+    auth_headers: Dict[str, str] = Depends(get_auth_headers)
+):
+    """
+    Sync the signing status by querying Dropbox Sign directly.
+    This is your safety net when callbacks fail.
+    """
+    session_data = signing_sessions.get(session_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    try:
+        # Get signature request details
+        signature_request_id = session_data["signature_request_id"]
+        status_url = f"{DROPBOX_SIGN_CONFIG['api_base_url']}/signature_request/{signature_request_id}"
+        
+        response = requests.get(status_url, headers=auth_headers)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"]["error_msg"])
+        
+        sig_request = result["signature_request"]
+        
+        # Map Dropbox Sign status to our enum
+        is_complete = sig_request.get("is_complete", False)
+        is_declined = sig_request.get("is_declined", False)
+        has_error = sig_request.get("has_error", False)
+        
+        if is_complete:
+            new_status = EnvelopeStatus.COMPLETED
+        elif is_declined:
+            new_status = EnvelopeStatus.DECLINED
+        elif has_error:
+            new_status = EnvelopeStatus.VOIDED
+        else:
+            new_status = EnvelopeStatus.SENT
+        
+        # Update our local cache
+        signing_sessions[session_id]["status"] = new_status
+        if new_status == EnvelopeStatus.COMPLETED:
+            signing_sessions[session_id]["signed_at"] = datetime.utcnow()
+            signing_sessions[session_id]["documents_available"] = True
+        
+        logger.info(f"Synchronized status for session {session_id}: {new_status}")
+        
+        return {
+            "session_id": session_id,
+            "signature_request_id": signature_request_id,
+            "status": new_status,
+            "last_sync": datetime.utcnow()
+        }
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to sync status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to sync status with Dropbox Sign")
 
 @app.get("/signing-complete")
 async def handle_signing_redirect(
     event: str = "signing_complete",
     session_id: Optional[str] = None,
-    envelope_id: Optional[str] = None
+    signature_request_id: Optional[str] = None
 ):
     """
-    Handles the redirect from DocuSign after signing is complete.
-    This is where users land after they finish (or cancel) signing.
-    
-    DocuSign adds query parameters to indicate what happened:
-    - event=signing_complete: Successfully signed
-    - event=cancel: User cancelled
-    - event=decline: User declined to sign
-    - event=ttl_expired: Signing link expired
+    Handle the redirect after embedded signing is complete.
+    This page is shown when the user completes/cancels signing in the iframe.
     """
-    # In a real app, you'd redirect to your frontend with status info
-    # For this demo, we'll return a simple HTML page
-    
     status_message = {
         "signing_complete": "Thank you for signing! You can now close this window.",
         "cancel": "Signing was cancelled. You can close this window and try again.",
         "decline": "You declined to sign the document.",
-        "ttl_expired": "The signing session expired. Please request a new signing link.",
+        "error": "An error occurred during signing. Please try again.",
     }.get(event, "Signing session ended.")
     
-    # Simple HTML response - in production, redirect to your React/Vue/etc frontend
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -493,13 +459,14 @@ async def handle_signing_redirect(
             .status-{event} {{ color: {"#28a745" if event == "signing_complete" else "#dc3545"}; }}
         </style>
         <script>
-            // Notify parent window (if in iframe) that signing is complete
+            // Notify parent window that signing is complete
+            // The hellosign-embedded library communicates with the parent window using events 
             if (window.parent !== window) {{
                 window.parent.postMessage({{
-                    type: 'docusign-signing-complete',
+                    type: 'dropbox-sign-complete',
                     event: '{event}',
                     sessionId: '{session_id or ""}',
-                    envelopeId: '{envelope_id or ""}'
+                    signatureRequestId: '{signature_request_id or ""}'
                 }}, '*');
             }}
         </script>
@@ -513,74 +480,22 @@ async def handle_signing_redirect(
     </html>
     """
     
-    from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html_content)
 
-@app.get("/sync-envelope-status/{session_id}")
-async def sync_envelope_status(
-    session_id: str,
-    envelopes_api: EnvelopesApi = Depends(get_envelopes_api)
-):
-    """
-    Synchronizes envelope status by querying DocuSign directly.
-    Use this as a fallback if webhooks fail or status seems incorrect.
-    
-    This demonstrates the "trust but verify" principle - while we maintain
-    our own status tracking for performance, we can always check the
-    source of truth (DocuSign) when needed.
-    """
-    session_data = signing_sessions.get(session_id)
-    if not session_data:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    try:
-        # Query DocuSign for the current envelope status
-        envelope = envelopes_api.get_envelope(
-            account_id=DOCUSIGN_CONFIG["account_id"],
-            envelope_id=session_data["envelope_id"]
-        )
-        
-        # Map DocuSign status to our enum
-        status_mapping = {
-            "created": EnvelopeStatus.CREATED,
-            "sent": EnvelopeStatus.SENT,
-            "delivered": EnvelopeStatus.DELIVERED,
-            "signed": EnvelopeStatus.SIGNED,
-            "completed": EnvelopeStatus.COMPLETED,
-            "declined": EnvelopeStatus.DECLINED,
-            "voided": EnvelopeStatus.VOIDED
-        }
-        
-        new_status = status_mapping.get(envelope.status, EnvelopeStatus.SENT)
-        
-        # Update our local cache with the authoritative status
-        signing_sessions[session_id]["status"] = new_status
-        if new_status == EnvelopeStatus.COMPLETED:
-            signing_sessions[session_id]["signed_at"] = envelope.completed_date_time
-            signing_sessions[session_id]["documents_available"] = True
-        
-        logger.info(f"Synchronized status for session {session_id}: {new_status}")
-        
-        return {
-            "session_id": session_id,
-            "envelope_id": session_data["envelope_id"],
-            "status": new_status,
-            "last_sync": datetime.utcnow()
-        }
-        
-    except ApiException as e:
-        logger.error(f"Failed to sync status: {e.body}")
-        raise HTTPException(status_code=500, detail="Failed to sync status with DocuSign")
-    
 @app.get("/health")
 async def health_check():
-    """
-    Health check endpoint to verify the service is running.
-    In production, you might also check DocuSign connectivity here.
-    """
-    return {"status": "healthy", "service": "DocuSign Signing Service"}
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "Dropbox Sign Signing Service"}
+
+# Add CORS middleware if needed for embedded signing
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-   
