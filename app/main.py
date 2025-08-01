@@ -27,7 +27,6 @@ webhook_handlers = WebhookHandlers(session_manager)
 @app.post("/create-signing-session", response_model=SigningSessionResponse)
 async def create_signing_session(signer_info: SignerInfo):
     """Creates a signing session using Dropbox Sign embedded signing."""
-    logger.debug(f"[1] Received /create-signing-session for email={signer_info.email}")
     
     try:
         # Create signature request
@@ -108,8 +107,6 @@ async def handle_dropbox_sign_callback(request: Request, background_tasks: Backg
     except Exception as e:
         logger.error(f"Error processing callback: {str(e)}")
         return JSONResponse(content={"HelloSign API Event Received": True})
-
-# ... other endpoints (status, download, etc.) - also refactored to use services
 
 app.add_middleware(
     CORSMiddleware,
