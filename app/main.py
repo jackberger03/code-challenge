@@ -11,8 +11,9 @@ import hmac
 import hashlib
 import json
 import io
-from app.models import EnvelopeStatus, SigningSessionResponse, SigningStatusResponse 
+from app.models import EnvelopeStatus, SignerInfo, SigningSessionResponse, SigningStatusResponse 
 from dotenv import load_dotenv
+import base64
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -41,9 +42,8 @@ def get_auth_headers() -> Dict[str, str]:
     Using API key authentication which is simpler than OAuth for server-to-server.
     """
     # Dropbox Sign uses Basic auth with API key as username, no password
-    import base64
     auth_string = f"{DROPBOX_SIGN_CONFIG['api_key']}:"
-    encoded_auth = base64.b64encode(auth_string.encode()).decode()
+    encoded_auth = base64.b64encode(auth_string.encode()).decode() # TODO: Understand this better
     
     return {
         "Authorization": f"Basic {encoded_auth}",
@@ -59,34 +59,25 @@ async def create_signing_session(
     Creates a signing session using Dropbox Sign embedded signing.
     This replaces the DocuSign envelope creation flow.
     """
-    logger.info(f"[1] Received /create-signing-session for email={signer_info.email}, role={signer_info.role_name}")
+    logger.debug(f"[1] Received /create-signing-session for email={signer_info.email}, role={signer_info.role_name}")
     try:
+        
         session_id = str(uuid.uuid4())
-        logger.info(f"Creating signing session {session_id} for {signer_info.email}")
+        logger.debug(f"Creating signing session {session_id} for {signer_info.email}")
         
         # Step 1: Create embedded signature request from template
         # This is similar to creating an envelope in DocuSign
         create_url = f"{DROPBOX_SIGN_CONFIG['api_base_url']}/signature_request/create_embedded_with_template"
         
-        # Prepare signers list
+        # Prepare signers list 
+        # FIXME
         signers = [{
-            "role": signer_info.role_name,  # Must match role in template
+            "role": signer_info.role_name,  # TODO: Make sure role name changes back to 'signer'
             "name": signer_info.name,
             "email_address": signer_info.email,
             "pin": None,  # Optional PIN for extra security
             "sms_phone_number": signer_info.phone if signer_info.phone else None
         }]
-        
-        # Create the signature request
-        request_data = {
-            "client_id": DROPBOX_SIGN_CONFIG["client_id"],
-            "template_ids": [DROPBOX_SIGN_CONFIG["template_id"]],
-            "subject": "Please sign this document",
-            "message": "Thanks for your business. Please review and sign the attached document.",
-            "signers": signers,
-            "test_mode": DROPBOX_SIGN_CONFIG["test_mode"],
-            "is_for_embedded_signing": True
-        }
         
         # For form data, Dropbox Sign expects a different format
         form_data = {
@@ -96,25 +87,27 @@ async def create_signing_session(
             # The template you created in Dropbox Sign
             "template_ids[0]": DROPBOX_SIGN_CONFIG["template_id"],
 
-            # Signer info (must match the “Hiring Manager” role in your template)
-            "signers[0][role]": signer_info.role_name,        # e.g. "Hiring Manager"
+            # Signer info (must match the “signer” role in your template)
+            "signers[0][role]": signer_info.role_name,        # e.g. "signer"
             "signers[0][name]": signer_info.name,             # e.g. "John"
             "signers[0][email_address]": signer_info.email,   # e.g. "john.doe@example.com"
 
             # Test mode flag (“1” or “0”)
             "test_mode": "1" if DROPBOX_SIGN_CONFIG["test_mode"] else "0",
 
-            # Prefill your custom textboxes
-            "custom_fields[full_name]": signer_info.name,     # Must match exactly “full_name”
+            # Prefill your custom textboxes #FIXME
+            "custom_fields[name]": signer_info.name,     # Must match exactly “name”
             "custom_fields[phone]": signer_info.phone or "",  # Must match exactly “phone”
+            "custom_fields[email]": signer_info.email,  # Must match exactly “email”
         }
+
         logger.debug(f"[2] Building Dropbox Sign API payload: form_data={form_data}")
         
         # Use form data for this endpoint
         headers = {
             "Authorization": auth_headers["Authorization"]
         }
-        logger.info(f"[3] Sending POST to Dropbox Sign: {create_url}")
+        logger.debug(f"[3] Sending POST to Dropbox Sign: {create_url}")
         response = requests.post(create_url, data=form_data, headers=headers)
         response.raise_for_status()
         
@@ -153,7 +146,8 @@ async def create_signing_session(
         embedded_sign_url = sign_url_result["embedded"]["sign_url"]
         expires_at = datetime.now() + timedelta(minutes=60)  # Dropbox Sign URLs last longer
         
-        # Store session data
+        # Store session data 
+        # FIXME understand this better
         session_data = {
             "session_id": session_id,
             "signature_request_id": signature_request_id,  # This is like envelope_id
@@ -167,12 +161,13 @@ async def create_signing_session(
         
         signing_sessions[session_id] = session_data
         signature_request_to_session[signature_request_id] = session_id
-        logger.info(f"[6] Caching signing session with session_id={session_id}, signature_request_id={signature_request_id}")
+        logger.debug(f"[6] Caching signing session with session_id={session_id}, signature_request_id={signature_request_id}")
         
-        logger.info(f"Successfully created signing URL for session {session_id}")
+        logger.debug(f"Successfully created signing URL for session {session_id}")
         
         # Return response (using envelope_id for backward compatibility)
-        logger.info(f"[7] Returning signing URL for session_id={session_id}")
+        logger.debug(f"[7] Returning signing URL for session_id={session_id}")
+        
         return SigningSessionResponse(
             signing_url=embedded_sign_url,
             session_id=session_id,
@@ -199,7 +194,7 @@ async def create_signing_session(
 @app.post("/dropbox-sign-callback")
 async def handle_dropbox_sign_callback(
     request: Request,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks # TODO Understand this better
 ):
     """
     Handles callbacks from Dropbox Sign for signature request events.
