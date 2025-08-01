@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, Dict, Any, List
 import os 
 from datetime import datetime, timedelta
@@ -32,39 +31,10 @@ DROPBOX_SIGN_CONFIG = {
     "api_base_url": os.getenv("DROPBOX_SIGN_API_BASE_URL", "https://api.hellosign.com/v3"),
 }
 
-logger.info(f"Dropbox Sign configuration loaded: {DROPBOX_SIGN_CONFIG}")
-
-# Session storage remains the same
+# Session storage
 signing_sessions: Dict[str, Dict[str, Any]] = {}
 signature_request_to_session: Dict[str, str] = {}  # Maps signature_request_id to session_id
-
-class SignerInfo(BaseModel):
-    email: EmailStr
-    name: str
-    role_name: str  # This will map to "role" in Dropbox Sign
-    phone: Optional[str] = None
-
-    @field_validator('name')
-    @classmethod
-    def name_must_not_be_empty(cls, value: str) -> str:
-        """Ensure that the name is not empty."""
-        if not value.strip():
-            raise ValueError("Name must not be empty")
-        if len(value) < 2:
-            raise ValueError("Name must be at least 2 characters long")
-        # Dropbox Sign accepts names with spaces
-        return value.strip()
-
-    @field_validator('phone')
-    @classmethod
-    def phone_basic_validation(cls, value: Optional[str]) -> Optional[str]:
-        """Basic phone validation."""
-        if value and not value.strip():
-            raise ValueError("Phone must not be empty")
-        if value and len(value) < 10:
-            raise ValueError("Phone must be at least 10 characters long")
-        return value
-
+ 
 def get_auth_headers() -> Dict[str, str]:
     """
     Get headers for Dropbox Sign API authentication.
