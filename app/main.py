@@ -81,26 +81,23 @@ async def create_signing_session(
         
         # For form data, Dropbox Sign expects a different format
         form_data = {
-            # Your API app’s client ID
             "client_id": DROPBOX_SIGN_CONFIG["client_id"],
-
-            # The template you created in Dropbox Sign
             "template_ids[0]": DROPBOX_SIGN_CONFIG["template_id"],
-
-            # Signer info (must match the “signer” role in your template)
-            "signers[0][role]": signer_info.role_name,        # e.g. "signer"
-            "signers[0][name]": signer_info.name,             # e.g. "John"
-            "signers[0][email_address]": signer_info.email,   # e.g. "john.doe@example.com"
-
-            # Test mode flag (“1” or “0”)
+            
+            # Use the role name "signer" as the key, not an array index
+            "signers[signer][name]": signer_info.name,
+            "signers[signer][email_address]": signer_info.email,
+            
+            # Test mode flag
             "test_mode": "1" if DROPBOX_SIGN_CONFIG["test_mode"] else "0",
-
-            # Prefill your custom textboxes #FIXME
-            "custom_fields[name]": signer_info.name,     # Must match exactly “name”
-            "custom_fields[phone]": signer_info.phone or "",  # Must match exactly “phone”
-            "custom_fields[email]": signer_info.email,  # Must match exactly “email”
+            
+            # Pre-filled data as JSON array
+            "custom_fields": json.dumps([
+                {"name": "name", "value": signer_info.name},
+                {"name": "phone", "value": signer_info.phone or ""},
+                {"name": "email", "value": signer_info.email}
+            ])
         }
-
         logger.debug(f"[2] Building Dropbox Sign API payload: form_data={form_data}")
         
         # Use form data for this endpoint
