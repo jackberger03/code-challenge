@@ -24,7 +24,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application code
 COPY app/ /app/
 
-# Copy static files and frontend
+# Create static directory and copy frontend files
+RUN mkdir -p /app/static
 COPY index.html /app/static/
 COPY index.css /app/static/
 COPY index.js /app/static/

@@ -1,6 +1,6 @@
 from datetime import datetime
-from app.models import EnvelopeStatus
-from app.services.session_manager import SessionManager
+from models import EnvelopeStatus
+from services.session_manager import SessionManager
 import logging
 
 logger = logging.getLogger(__name__)

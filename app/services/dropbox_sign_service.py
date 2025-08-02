@@ -3,7 +3,7 @@ import base64
 import json
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
-from app.models import SignerInfo, EnvelopeStatus
+from models import SignerInfo, EnvelopeStatus
 import logging
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ class DropboxSignService:
             "template_ids[0]": self.config["template_id"],
             "signers[signer][name]": signer_info.name,
             "signers[signer][email_address]": signer_info.email,
-            "test_mode": "1" if self.config["test_mode"] else "0",
+            "test_mode": "1",  # Hardcoded to 1 for demo
             
             "custom_fields": json.dumps([
                 {"name": "name", "value": signer_info.name},

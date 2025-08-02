@@ -1,22 +1,26 @@
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from typing import Optional
 from datetime import datetime, timedelta
 import logging
 import json
 import io
 
-from app.models import SignerInfo, SigningSessionResponse, SigningStatusResponse
-from app.config import get_dropbox_sign_config
-from app.services.dropbox_sign_service import DropboxSignService
-from app.services.session_manager import SessionManager
-from app.handlers.webhook_handlers import WebhookHandlers
+from models import SignerInfo, SigningSessionResponse, SigningStatusResponse
+from config import get_dropbox_sign_config
+from services.dropbox_sign_service import DropboxSignService
+from services.session_manager import SessionManager
+from handlers.webhook_handlers import WebhookHandlers
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Initialize services
 config = get_dropbox_sign_config()
@@ -117,7 +121,7 @@ async def force_completion(session_id: str):
             raise HTTPException(status_code=404, detail="Session not found")
         
         # Update session to completed
-        from app.models import EnvelopeStatus
+        from models import EnvelopeStatus
         session_manager.update_session_status(
             session_id,
             EnvelopeStatus.COMPLETED,
@@ -136,6 +140,16 @@ async def force_completion(session_id: str):
 async def health_check():
     """Health check endpoint for Docker healthcheck."""
     return {"status": "healthy", "service": "document-signing-api"}
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serve the main frontend HTML file."""
+    try:
+        with open("static/index.html", "r") as f:
+            html_content = f.read()
+        return HTMLResponse(content=html_content)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Frontend not found")
 
 app.add_middleware(
     CORSMiddleware,

@@ -1,6 +1,6 @@
 from typing import Dict, Any, Optional
 from datetime import datetime
-from app.models import EnvelopeStatus, SignerInfo
+from models import EnvelopeStatus, SignerInfo
 import uuid
 
 class SessionManager:
