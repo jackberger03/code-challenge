@@ -26,9 +26,7 @@ COPY app/ /app/
 
 # Create static directory and copy frontend files
 RUN mkdir -p /app/static
-COPY index.html /app/static/
-COPY index.css /app/static/
-COPY index.js /app/static/
+COPY frontend/ /app/static/
 
 # Create non-root user for security
 RUN adduser --disabled-password --gecos '' appuser && \
