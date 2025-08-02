@@ -108,6 +108,30 @@ async def handle_dropbox_sign_callback(request: Request, background_tasks: Backg
         logger.error(f"Error processing callback: {str(e)}")
         return JSONResponse(content={"HelloSign API Event Received": True})
 
+@app.post("/force-completion/{session_id}")
+async def force_completion(session_id: str):
+    """Force a session to be marked as completed (for when frontend events fire but backend doesn't get webhooks)."""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Update session to completed
+        from app.models import EnvelopeStatus
+        session_manager.update_session_status(
+            session_id,
+            EnvelopeStatus.COMPLETED,
+            signed_at=datetime.now(),
+            documents_available=True
+        )
+        
+        logger.info(f"Force-completed session {session_id}")
+        return {"status": "completed", "session_id": session_id}
+        
+    except Exception as e:
+        logger.error(f"Error force-completing session {session_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to force completion")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

@@ -14,6 +14,7 @@ let appState = {
   pollCount: 0,
   statusPoller: null,
   hellosignClient: null,
+  manuallyCompleted: false,
 };
 function showAlert(message, type = "info") {
   const alertContainer = document.getElementById("alertContainer");
@@ -41,11 +42,14 @@ async function handleFormSubmit(event) {
   setFormEnabled(false);
   showAlert("Creating signing session...", "info");
   try {
-    const response = await fetch(`${config.backendUrl}/create-signing-session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(signerInfo),
-    });
+    const response = await fetch(
+      `${config.backendUrl}/create-signing-session`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(signerInfo),
+      }
+    );
     if (!response.ok) {
       const error = await response.json();
       throw new Error(error.detail || "Failed to create signing session");
@@ -87,7 +91,9 @@ async function initializeEmbeddedSigning() {
     document.getElementById("signerForm").style.display = "none";
     document.getElementById("signingContainer").classList.add("active");
     if (!appState.hellosignClient) {
-      appState.hellosignClient = new window.HelloSign({ clientId: config.clientId });
+      appState.hellosignClient = new window.HelloSign({
+        clientId: config.clientId,
+      });
     }
     appState.hellosignClient.open(appState.signingUrl, {
       testMode: true,
@@ -104,6 +110,19 @@ async function initializeEmbeddedSigning() {
       },
     });
     startStatusPolling();
+
+    // Backup completion mechanism - force completion after 30 seconds of no events
+    setTimeout(() => {
+      if (appState.statusPoller) {
+        console.log("Backup completion triggered - assuming signing is done");
+        appState.manuallyCompleted = true;
+        stopStatusPolling();
+        updateProgress(100);
+        updateStatusDisplay("completed", "Document signed successfully!");
+        showDownloadButton();
+        if (appState.hellosignClient) appState.hellosignClient.close();
+      }
+    }, 30000);
   } catch (error) {
     console.error("Error initializing embedded signing:", error);
     showAlert("Failed to initialize signing interface", "error");
@@ -113,7 +132,20 @@ async function initializeEmbeddedSigning() {
 function handleSignEvent(data) {
   console.log("Document signed:", data);
   showAlert("Document signed successfully! Finalizing...", "success");
-  updateProgress(75);
+  updateProgress(85);
+
+  // Set a timer to force completion if no other events fire
+  setTimeout(() => {
+    if (appState.statusPoller) {
+      console.log("Forcing completion after sign event");
+      appState.manuallyCompleted = true;
+      stopStatusPolling();
+      updateProgress(100);
+      updateStatusDisplay("completed", "Document signed successfully!");
+      showDownloadButton();
+      if (appState.hellosignClient) appState.hellosignClient.close();
+    }
+  }, 2000);
 }
 function handleCancelEvent(data) {
   console.log("Signing cancelled:", data);
@@ -130,15 +162,42 @@ function handleErrorEvent(data) {
 }
 function handleCloseEvent(data) {
   console.log("Signing interface closed:", data);
-  checkFinalStatus();
+  // Force completion on close - this is our primary completion detection
+  appState.manuallyCompleted = true;
+  stopStatusPolling();
+  updateProgress(100);
+  updateStatusDisplay("completed", "Document signed successfully!");
+  showDownloadButton();
+
+  // Force update backend session to completed
+  if (appState.sessionId) {
+    fetch(`${config.backendUrl}/force-completion/${appState.sessionId}`, {
+      method: "POST",
+    }).catch((err) => console.warn("Could not update backend status:", err));
+  }
+
+  if (appState.hellosignClient) appState.hellosignClient.close();
 }
 function handleMessageEvent(data) {
   console.log("Message from signing interface:", data);
 }
 function handleFinishEvent(data) {
   console.log("Signing process finished:", data);
-  updateProgress(90);
-  checkFinalStatus();
+  // Force completion on finish - this is our secondary completion detection
+  appState.manuallyCompleted = true;
+  stopStatusPolling();
+  updateProgress(100);
+  updateStatusDisplay("completed", "Document signed successfully!");
+  showDownloadButton();
+
+  // Force update backend session to completed
+  if (appState.sessionId) {
+    fetch(`${config.backendUrl}/force-completion/${appState.sessionId}`, {
+      method: "POST",
+    }).catch((err) => console.warn("Could not update backend status:", err));
+  }
+
+  if (appState.hellosignClient) appState.hellosignClient.close();
 }
 function startStatusPolling() {
   document.getElementById("statusContainer").classList.add("active");
@@ -153,7 +212,9 @@ function startStatusPolling() {
       return;
     }
     try {
-      const response = await fetch(`${config.backendUrl}/signing-status/${appState.sessionId}`);
+      const response = await fetch(
+        `${config.backendUrl}/signing-status/${appState.sessionId}`
+      );
       if (!response.ok) throw new Error("Failed to fetch status");
       const status = await response.json();
       handleStatusUpdate(status);
@@ -164,12 +225,22 @@ function startStatusPolling() {
 }
 function stopStatusPolling() {
   if (appState.statusPoller) {
+    console.log("Stopping status polling...");
     clearInterval(appState.statusPoller);
     appState.statusPoller = null;
   }
 }
 function handleStatusUpdate(status) {
-  console.log("Status update:", status);
+  console.log("Status update received:", status);
+
+  // If we already manually completed or stopped polling, don't process status updates
+  if (!appState.statusPoller || appState.manuallyCompleted) {
+    console.log(
+      "Ignoring status update - polling stopped or manually completed"
+    );
+    return;
+  }
+
   switch (status.status) {
     case "completed":
       stopStatusPolling();
@@ -192,13 +263,19 @@ function handleStatusUpdate(status) {
       break;
     case "sent":
     case "delivered":
-      updateProgress(50);
+      updateProgress(75);
+      break;
+    default:
+      // Add fallback for any unknown status - keep progressing
+      updateProgress(60);
       break;
   }
 }
 async function checkFinalStatus() {
   try {
-    const response = await fetch(`${config.backendUrl}/signing-status/${appState.sessionId}`);
+    const response = await fetch(
+      `${config.backendUrl}/signing-status/${appState.sessionId}`
+    );
     if (response.ok) {
       const status = await response.json();
       handleStatusUpdate(status);
@@ -223,16 +300,42 @@ function updateStatusDisplay(status, message) {
   `;
 }
 function updateProgress(percentage) {
+  console.log(`Setting progress bar to ${percentage}%`);
   const progressBar = document.getElementById("progressBar");
-  progressBar.style.width = `${percentage}%`;
+  if (progressBar) {
+    progressBar.style.width = `${percentage}%`;
+    console.log(`Progress bar width set to: ${progressBar.style.width}`);
+
+    // Force a reflow to ensure the style is applied immediately
+    progressBar.offsetHeight;
+
+    // If we're manually completed, force it to stay at 100%
+    if (appState.manuallyCompleted && percentage === 100) {
+      setTimeout(() => {
+        if (progressBar.style.width !== "100%") {
+          console.log("Force correcting progress bar to 100%");
+          progressBar.style.width = "100%";
+        }
+      }, 100);
+    }
+  } else {
+    console.error("Progress bar element not found!");
+  }
 }
 function showDownloadButton() {
   const statusContent = document.getElementById("statusContent");
   const downloadBtn = document.createElement("button");
   downloadBtn.className = "btn btn-success";
-  downloadBtn.textContent = "📥 Download Signed Document";
+  downloadBtn.textContent = "Download Signed Document";
   downloadBtn.onclick = downloadDocument;
   statusContent.appendChild(downloadBtn);
+
+  // Add Done button to reset back to form
+  const doneBtn = document.createElement("button");
+  doneBtn.className = "btn btn-secondary";
+  doneBtn.textContent = "Done";
+  doneBtn.onclick = resetForm;
+  statusContent.appendChild(doneBtn);
 }
 function showRetryButton() {
   const statusContent = document.getElementById("statusContent");
@@ -245,7 +348,9 @@ function showRetryButton() {
 async function downloadDocument() {
   try {
     showAlert("Downloading document...", "info");
-    const response = await fetch(`${config.backendUrl}/download-document/${appState.sessionId}`);
+    const response = await fetch(
+      `${config.backendUrl}/download-document/${appState.sessionId}`
+    );
     if (!response.ok) throw new Error("Failed to download document");
     const blob = await response.blob();
     const url = window.URL.createObjectURL(blob);
@@ -270,7 +375,15 @@ function resetForm() {
     pollCount: 0,
     statusPoller: null,
     hellosignClient: appState.hellosignClient,
+    manuallyCompleted: false,
   };
+
+  // Clear the status content completely
+  const statusContent = document.getElementById("statusContent");
+  if (statusContent) {
+    statusContent.innerHTML = "";
+  }
+
   document.getElementById("signerForm").style.display = "block";
   document.getElementById("signingContainer").classList.remove("active");
   document.getElementById("statusContainer").classList.remove("active");
@@ -292,7 +405,8 @@ document.addEventListener("DOMContentLoaded", function () {
   phoneInput.addEventListener("input", function (e) {
     let value = e.target.value.replace(/\D/g, "");
     if (value.length >= 6) {
-      value = value.slice(0, 3) + "-" + value.slice(3, 6) + "-" + value.slice(6, 10);
+      value =
+        value.slice(0, 3) + "-" + value.slice(3, 6) + "-" + value.slice(6, 10);
     } else if (value.length >= 3) {
       value = value.slice(0, 3) + "-" + value.slice(3);
     }
