@@ -132,6 +132,11 @@ async def force_completion(session_id: str):
         logger.error(f"Error force-completing session {session_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to force completion")
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Docker healthcheck."""
+    return {"status": "healthy", "service": "document-signing-api"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
