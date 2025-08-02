@@ -119,7 +119,7 @@ async function initializeEmbeddedSigning() {
         stopStatusPolling();
         updateProgress(100);
         updateStatusDisplay("completed", "Document signed successfully!");
-        showDownloadButton();
+        showCompletionStatus();
         if (appState.hellosignClient) appState.hellosignClient.close();
       }
     }, 30000);
@@ -142,7 +142,7 @@ function handleSignEvent(data) {
       stopStatusPolling();
       updateProgress(100);
       updateStatusDisplay("completed", "Document signed successfully!");
-      showDownloadButton();
+      showCompletionStatus();
       if (appState.hellosignClient) appState.hellosignClient.close();
     }
   }, 2000);
@@ -167,7 +167,7 @@ function handleCloseEvent(data) {
   stopStatusPolling();
   updateProgress(100);
   updateStatusDisplay("completed", "Document signed successfully!");
-  showDownloadButton();
+  showCompletionStatus();
 
   // Force update backend session to completed
   if (appState.sessionId) {
@@ -188,7 +188,7 @@ function handleFinishEvent(data) {
   stopStatusPolling();
   updateProgress(100);
   updateStatusDisplay("completed", "Document signed successfully!");
-  showDownloadButton();
+  showCompletionStatus();
 
   // Force update backend session to completed
   if (appState.sessionId) {
@@ -246,7 +246,7 @@ function handleStatusUpdate(status) {
       stopStatusPolling();
       updateStatusDisplay("completed", "Document signed successfully!");
       updateProgress(100);
-      showDownloadButton();
+      showCompletionStatus();
       if (appState.hellosignClient) appState.hellosignClient.close();
       break;
     case "declined":
@@ -321,14 +321,9 @@ function updateProgress(percentage) {
     console.error("Progress bar element not found!");
   }
 }
-function showDownloadButton() {
+function showCompletionStatus() {
   const statusContent = document.getElementById("statusContent");
-  const downloadBtn = document.createElement("button");
-  downloadBtn.className = "btn btn-success";
-  downloadBtn.textContent = "Download Signed Document";
-  downloadBtn.onclick = downloadDocument;
-  statusContent.appendChild(downloadBtn);
-
+  
   // Add Done button to reset back to form
   const doneBtn = document.createElement("button");
   doneBtn.className = "btn btn-secondary";
@@ -343,28 +338,6 @@ function showRetryButton() {
   retryBtn.textContent = "🔄 Try Again";
   retryBtn.onclick = resetForm;
   statusContent.appendChild(retryBtn);
-}
-async function downloadDocument() {
-  try {
-    showAlert("Downloading document...", "info");
-    const response = await fetch(
-      `${config.backendUrl}/download-document/${appState.sessionId}`
-    );
-    if (!response.ok) throw new Error("Failed to download document");
-    const blob = await response.blob();
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `signed_document_${appState.sessionId}.pdf`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    window.URL.revokeObjectURL(url);
-    showAlert("Document downloaded successfully!", "success");
-  } catch (error) {
-    console.error("Error downloading document:", error);
-    showAlert("Failed to download document", "error");
-  }
 }
 function resetForm() {
   appState = {
