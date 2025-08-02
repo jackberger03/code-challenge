@@ -296,7 +296,6 @@ function updateStatusDisplay(status, message) {
   statusContent.innerHTML = `
     <div class="status-icon">${icons[status] || "📄"}</div>
     <div class="status-message">${message}</div>
-    <div class="status-details">Session ID: ${appState.sessionId || "N/A"}</div>
   `;
 }
 function updateProgress(percentage) {
