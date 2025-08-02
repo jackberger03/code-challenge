@@ -88,10 +88,25 @@ async def handle_dropbox_sign_callback(request: Request, background_tasks: Backg
         json_data = form_data.get("json")
         
         if json_data:
-            event_data = json.loads(json_data)
+            if not isinstance(json_data, str):
+                raise ValueError("Invalid JSON data format")
+            try:
+                event_data = json.loads(json_data)
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in form data: {e}")
+                raise ValueError("Invalid JSON format in form data")
         else:
             body = await request.body()
-            event_data = json.loads(body)
+            if not body:
+                raise ValueError("Empty request body")
+            try:
+                event_data = json.loads(body.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in request body: {e}")
+                raise ValueError("Invalid JSON format in request body")
+            except UnicodeDecodeError as e:
+                logger.error(f"Invalid encoding in request body: {e}")
+                raise ValueError("Invalid encoding in request body")
         
         event_type = event_data.get("event", {}).get("event_type")
         signature_request_id = event_data.get("signature_request", {}).get("signature_request_id")
