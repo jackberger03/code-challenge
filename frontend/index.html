@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document Signing Portal</title>
+
+    <!-- Dropbox Sign (HelloSign) Embedded Library v2 -->
+    <script src="https://cdn.hellosign.com/public/js/embedded/v2.0.0/embedded.production.min.js"></script>
+    <link rel="stylesheet" href="/static/index.css" />
+  </head>
+  <body>
+    <div class="container">
+      <!-- Header Section -->
+      <div class="header">
+        <h1>Document Signing Portal</h1>
+        <p>Sign your documents securely and efficiently</p>
+      </div>
+
+      <!-- Alert Messages -->
+      <div id="alertContainer"></div>
+
+      <!-- Signer Information Form -->
+      <div id="signerForm" class="card">
+        <h2>Signer Information</h2>
+        <p style="color: #7f8c8d; margin-bottom: 20px">
+          Please provide your information to begin the signing process
+        </p>
+
+        <form id="signingForm">
+          <div class="form-group">
+            <label for="name">
+              Full Name *
+              <span class="tooltip">
+                <span class="tooltip-text"
+                  >Your legal name as it should appear on the document</span
+                >
+              </span>
+            </label>
+            <input
+              type="text"
+              id="name"
+              name="name"
+              required
+              minlength="2"
+              placeholder="John Doe"
+              aria-describedby="name-helper"
+            />
+            <div id="name-helper" class="helper-text">
+              Enter your full legal name
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="email">
+              Email Address *
+              <span class="tooltip">
+                <span class="tooltip-text"
+                  >We'll use this to send you a copy of the signed
+                  document</span
+                >
+              </span>
+            </label>
+            <input
+              type="email"
+              id="email"
+              name="email"
+              required
+              placeholder="john.doe@example.com"
+              aria-describedby="email-helper"
+            />
+            <div id="email-helper" class="helper-text">
+              Enter a valid email address
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="phone">
+              Phone Number (Optional)
+              <span class="tooltip">
+                <span class="tooltip-text"
+                  >We may use this for SMS verification if enabled</span
+                >
+              </span>
+            </label>
+            <input
+              type="tel"
+              id="phone"
+              name="phone"
+              placeholder="(555) 123-4567"
+              pattern="[0-9]{3}-?[0-9]{3}-?[0-9]{4}"
+              aria-describedby="phone-helper"
+            />
+            <div id="phone-helper" class="helper-text">
+              10-digit phone number (optional)
+            </div>
+          </div>
+
+          <button type="submit" class="btn" id="submitBtn">Next →</button>
+        </form>
+      </div>
+
+      <!-- Signing Container -->
+      <div id="signingContainer" class="signing-container"></div>
+
+      <!-- Status Display -->
+      <div id="statusContainer" class="card status-container">
+        <div id="statusContent">
+          <!-- Status content will be dynamically inserted here -->
+        </div>
+        <div class="progress-bar">
+          <div class="progress-bar-fill" id="progressBar"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Load modules in dependency order -->
+    <script src="/static/js/index.js"></script>
+  </body>
+</html>
